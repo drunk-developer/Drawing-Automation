@@ -1,33 +1,17 @@
 import streamlit as st
 import os
-import win32com.client
 import pandas as pd
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.util import Pt
 from copy import deepcopy
+import tempfile
+import zipfile
+import platform
+import subprocess
 
-# --- Stage 1: Convert PPT to PPTX ---
-'''
-def convert_ppt_to_pptx(input_folder):
-    ppt_files = [f for f in os.listdir(input_folder) if f.lower().endswith('.ppt')]
-    powerpoint = win32com.client.Dispatch("PowerPoint.Application")
-    powerpoint.Visible = 1
-    for ppt_file in ppt_files:
-        full_path = os.path.join(input_folder, ppt_file)
-        pptx_path = os.path.join(input_folder, ppt_file[:-4] + '.pptx')
-        st.info(f"Converting {ppt_file} to {pptx_path}...")
-        presentation = powerpoint.Presentations.Open(full_path, WithWindow=False)
-        presentation.SaveAs(pptx_path, FileFormat=24)  # 24 = pptx
-        presentation.Close()
-    powerpoint.Quit()
-    st.success("All .ppt files converted to .pptx.")
-'''
-# --- Stage 2: Extract revision data to Excel ---
-REV_HEADERS = [
-    "RELEASE NUMBER", "REV LTR",
-    "REVISION DESCRIPTION", "BY", "DATE", "APPD"
-]
+# --- Helper functions ---
+REV_HEADERS = ["RELEASE NUMBER", "REV LTR", "REVISION DESCRIPTION", "BY", "DATE", "APPD"]
 
 def is_revision_table(table):
     header = [cell.text.strip().upper() for cell in table.rows[0].cells]
@@ -70,13 +54,15 @@ def get_balloon_letters_flexible(slide):
         balloon_letters.append(nearest_letter)
     return balloon_letters
 
-def extract_revision_data_multisheet(input_folder, excel_path):
+def extract_revision_data_multisheet_from_files(uploaded_files):
     per_drawing = {}
-    for ppt_file in sorted(os.listdir(input_folder)):
-        if ppt_file.lower().endswith(".pptx"):
-            ppt_path = os.path.join(input_folder, ppt_file)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for uploaded_file in uploaded_files:
+            ppt_path = os.path.join(temp_dir, uploaded_file.name)
+            with open(ppt_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
             prs = Presentation(ppt_path)
-            drawing_name = os.path.splitext(ppt_file)[0]
+            drawing_name = os.path.splitext(uploaded_file.name)[0]
             revision_rows = []
             balloon_letters = []
             for slide in prs.slides:
@@ -96,20 +82,29 @@ def extract_revision_data_multisheet(input_folder, excel_path):
             if sheet_rows:
                 columns = REV_HEADERS + ["Balloon Text"]
                 per_drawing[drawing_name] = pd.DataFrame(sheet_rows, columns=columns)
-    with pd.ExcelWriter(excel_path) as writer:
-        for name, df in per_drawing.items():
-            sheet_name = str(name)[:31]
-            df.to_excel(writer, index=False, sheet_name=sheet_name)
-    st.success(f"Extraction complete. Data saved in: {excel_path}")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        with pd.ExcelWriter(tmp.name) as writer:
+            for name, df in per_drawing.items():
+                sheet_name = str(name)[:31]
+                df.to_excel(writer, index=False, sheet_name=sheet_name)
+        tmp.seek(0)
+        with open(tmp.name, "rb") as f:
+            excel_bytes = f.read()
+    return excel_bytes
 
-# --- Stage 3: Edit PPTs from updated Excel ---
+# Auto open Excel file (Windows only)
+def open_excel_local(excel_path):
+    if platform.system() == "Windows":
+        try:
+            os.startfile(excel_path)
+        except Exception as e:
+            st.warning(f"Could not open Excel automatically: {e}")
+
 TABLE_FONT = "Arial Narrow"
 TABLE_SIZE = Pt(7)
 BALLOON_FONT = "Arial"
 BALLOON_SIZE = Pt(11)
-REVISION_HEADERS = [
-    "RELEASE NUMBER", "REV LTR", "REVISION DESCRIPTION", "BY", "DATE", "APPD"
-]
+REVISION_HEADERS = ["RELEASE NUMBER", "REV LTR", "REVISION DESCRIPTION", "BY", "DATE", "APPD"]
 
 def is_revision_table_edit(headers):
     normalized = [h.upper().replace(" ", "") for h in headers]
@@ -134,142 +129,183 @@ def add_revision_rows(table, revision_data):
                 para.font.name = TABLE_FONT
                 para.font.size = TABLE_SIZE
 
-def update_table_and_balloon_for_all(multisheet_excel, ppt_folder, output_folder):
-    xl = pd.ExcelFile(multisheet_excel)
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-    for ppt_file in sorted(os.listdir(ppt_folder)):
-        if ppt_file.lower().endswith(".pptx"):
-            ppt_name = os.path.splitext(ppt_file)[0]
-            try:
-                if ppt_name not in xl.sheet_names:
-                    st.warning(f"Sheet for {ppt_file} not found, skipping.")
-                    continue
-                df = xl.parse(ppt_name).dropna(how='all')
-                if df.empty:
-                    st.warning(f"Sheet {ppt_name} is empty, skipping.")
-                    continue
-                revision_data = df[REVISION_HEADERS].values.tolist()
-                balloon_values = df["Balloon Text"].dropna()
-                balloon_letter = str(balloon_values.iloc[-1]) if not balloon_values.empty else ""
-                pptx_path = os.path.join(ppt_folder, ppt_file)
-                output_path = os.path.join(output_folder, ppt_file)
-                prs = Presentation(pptx_path)
-                revision_done = False
-                for slide in prs.slides:
-                    for shape in slide.shapes:
-                        if shape.has_table:
-                            headers = [cell.text.strip().upper() for cell in shape.table.rows[0].cells]
-                            if is_revision_table_edit(headers) and not revision_done:
-                                clear_table_rows(shape.table)
-                                add_revision_rows(shape.table, revision_data)
-                                revision_done = True
-                for slide in prs.slides:
-                    for shape in slide.shapes:
-                        if shape.has_text_frame and shape.text.strip():
-                            txt = shape.text.strip()
-                            if (len(txt) == 1 and txt.isalpha()) or (len(txt) == 2 and txt[0].isalpha() and txt[1] == '.'):
-                                if balloon_letter:
-                                    shape.text = str(balloon_letter)
-                                    para = shape.text_frame.paragraphs[0]
-                                    para.font.name = BALLOON_FONT
-                                    para.font.size = BALLOON_SIZE
-                prs.save(output_path)
-                st.success(f"Updated: {ppt_file}")
-            except Exception as e:
-                st.error(f"Error updating {ppt_file}: {e}")
+def update_table_and_balloon_for_all(excel_bytes, uploaded_ppt_files):
+    results = {}
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as xl_file, tempfile.TemporaryDirectory() as tmp_dir:
+        xl_file.write(excel_bytes)
+        xl_file.flush()
+        xl = pd.ExcelFile(xl_file.name)
+        for ppt_file in uploaded_ppt_files:
+            ppt_name = os.path.splitext(ppt_file.name)[0]
+            if ppt_name not in xl.sheet_names:
+                continue
+            df = xl.parse(ppt_name).dropna(how='all')
+            if df.empty:
+                continue
+            revision_data = df[REVISION_HEADERS].values.tolist()
+            balloon_values = df["Balloon Text"].dropna()
+            balloon_letter = str(balloon_values.iloc[-1]) if not balloon_values.empty else ""
+            pptx_path = os.path.join(tmp_dir, ppt_file.name)
+            with open(pptx_path, "wb") as f:
+                f.write(ppt_file.getbuffer())
+            prs = Presentation(pptx_path)
+            revision_done = False
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    if shape.has_table:
+                        headers = [cell.text.strip().upper() for cell in shape.table.rows[0].cells]
+                        if is_revision_table_edit(headers) and not revision_done:
+                            clear_table_rows(shape.table)
+                            add_revision_rows(shape.table, revision_data)
+                            revision_done = True
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    if shape.has_text_frame and shape.text.strip():
+                        txt = shape.text.strip()
+                        if (len(txt) == 1 and txt.isalpha()) or (len(txt) == 2 and txt[0].isalpha() and txt[1] == '.'):
+                            if balloon_letter:
+                                shape.text = str(balloon_letter)
+                                para = shape.text_frame.paragraphs[0]
+                                para.font.name = BALLOON_FONT
+                                para.font.size = BALLOON_SIZE
+            out_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pptx")
+            prs.save(out_file.name)
+            out_file.seek(0)
+            with open(out_file.name, "rb") as f:
+                results[ppt_file.name] = f.read()
+    return results
 
-# --- Stage 4: Add bullet point to PPTX ---
-def add_bullet_point_to_pptx(input_folder, output_folder, new_text_line):
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-    for filename in os.listdir(input_folder):
-        if not filename.endswith(".pptx"):
-            continue
-        file_path = os.path.join(input_folder, filename)
-        prs = Presentation(file_path)
-        modified = False
-        for slide in prs.slides:
-            for shape in slide.shapes:
-                if not shape.has_text_frame:
-                    continue
-                text_frame = shape.text_frame
-                paragraphs = [p for p in text_frame.paragraphs if p.text.strip() != ""]
-                if len(paragraphs) < 2:
-                    continue
-                last_paragraph = paragraphs[-1]
-                font_name = None
-                font_size = None
-                if last_paragraph.runs:
-                    font_name = last_paragraph.runs[0].font.name
-                    font_size = last_paragraph.runs[0].font.size
-                blank_para = text_frame.add_paragraph()
-                blank_para.text = " "
-                new_para = text_frame.add_paragraph()
-                new_para.text = f"{len(paragraphs) + 1}. {new_text_line}"
-                new_para.level = last_paragraph.level
-                if new_para.runs:
-                    run = new_para.runs[0]
-                    run.font.name = font_name if font_name else "Arial"
-                    run.font.size = font_size
-                modified = True
-        if modified:
-            output_path = os.path.join(output_folder, f"updated_{filename}")
-            prs.save(output_path)
-            st.success(f"Updated file saved: {output_path}")
-        else:
-            st.warning(f"No bullet text found in: {filename}")
+def add_bullet_point_to_pptx(uploaded_ppt_files, new_text_line):
+    results = {}
+    for ppt_file in uploaded_ppt_files:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp:
+            tmp.write(ppt_file.getbuffer())
+            tmp.flush()
+            prs = Presentation(tmp.name)
+            modified = False
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    if not shape.has_text_frame:
+                        continue
+                    text_frame = shape.text_frame
+                    paragraphs = [p for p in text_frame.paragraphs if p.text.strip() != ""]
+                    if len(paragraphs) < 2:
+                        continue
+                    last_paragraph = paragraphs[-1]
+                    font_name = None
+                    font_size = None
+                    if last_paragraph.runs:
+                        font_name = last_paragraph.runs[0].font.name
+                        font_size = last_paragraph.runs[0].font.size
+                    blank_para = text_frame.add_paragraph()
+                    blank_para.text = " "
+                    new_para = text_frame.add_paragraph()
+                    new_para.text = f"{len(paragraphs) + 1}. {new_text_line}"
+                    new_para.level = last_paragraph.level
+                    if new_para.runs:
+                        run = new_para.runs[0]
+                        run.font.name = font_name if font_name else "Arial"
+                        run.font.size = font_size
+                    modified = True
+            if modified:
+                prs.save(tmp.name)
+                tmp.seek(0)
+                results[ppt_file.name] = tmp.read()
+    return results
 
-# ================ Streamlit UI ================
+# ========== Streamlit UI ==========
 
-st.title("PowerPoint Engineering Drawings Automation")
+st.title("PowerPoint Engineering Drawings Automation (Cloud Compatible)")
 
-st.sidebar.header("Select Stage to Run")
+input_method = st.radio("Select input method", ["Upload Files", "Provide Local Folder Path (Local Only)"])
+
+if input_method == "Upload Files":
+    uploaded_pptxs = st.file_uploader("Upload .pptx files", type="pptx", accept_multiple_files=True)
+    input_folder = None
+else:
+    input_folder = st.text_input("Enter local folder path")
+    uploaded_pptxs = None
+    if input_folder and not os.path.isdir(input_folder):
+        st.error("Please enter a valid folder path.")
+
 stage = st.sidebar.radio(
-    "Automation Stages",
-    ("1: Convert PPT to PPTX",
-     "2: Extract Revision Data to Excel",
-     "3: Edit PPTs from Excel",
-     "4: Add Bullet Point to PPTX")
+    "Choose Automation Stage",
+    (
+        "Step 1: Extract Revision Data to Excel",
+        "Step 2: Edit PPTX from Excel",
+        "Step 3: Add Bullet Point to PPTX"
+    )
 )
 
-if stage == "1: Convert PPT to PPTX":
-    st.header("Stage 1: Convert PPT to PPTX")
-    input_folder = st.text_input("Input Folder Path (containing .ppt files)")
-    if st.button("Run Conversion"):
-        if input_folder and os.path.exists(input_folder):
-            convert_ppt_to_pptx(input_folder)
+if stage == "Step 1: Extract Revision Data to Excel":
+    st.header("Step 1: Extract Revision Table and Balloon Data")
+    if st.button("Extract Data to Excel"):
+        # Source files depends on user input mode
+        source_files = uploaded_pptxs
+        if input_folder and os.path.isdir(input_folder):
+            source_files = [
+                open(os.path.join(input_folder, f), "rb") for f in os.listdir(input_folder) if f.lower().endswith(".pptx")
+            ]
+        if source_files:
+            excel_bytes = extract_revision_data_multisheet_from_files(source_files)
+            # Save Excel to input folder locally & open automatically
+            if input_folder and os.path.isdir(input_folder) and platform.system() == "Windows":
+                excel_path = os.path.join(input_folder, "Extracted_Revision_Data.xlsx")
+                with open(excel_path, "wb") as f:
+                    f.write(excel_bytes)
+                st.success(f"Excel saved to {excel_path} and opened for editing.")
+                open_excel_local(excel_path)
+            else:
+                st.success("Extraction complete! Download your Excel file below.")
+                st.download_button("Download Excel", data=excel_bytes, file_name="Extracted_Revision_Data.xlsx")
         else:
-            st.error("Please provide a valid input folder path.")
+            st.warning("Please upload or specify valid .pptx files.")
 
-elif stage == "2: Extract Revision Data to Excel":
-    st.header("Stage 2: Extract Revision Data to Excel")
-    input_folder = st.text_input("Input Folder Path (containing .pptx files)")
-    excel_path = st.text_input("Save Excel File To (full path with .xlsx)")
-    if st.button("Run Extraction"):
-        if input_folder and os.path.exists(input_folder) and excel_path:
-            extract_revision_data_multisheet(input_folder, excel_path)
-        else:
-            st.error("Please provide valid folder and excel save path.")
+elif stage == "Step 2: Edit PPTX from Excel":
+    st.header("Step 2: Edit PPTX Files Based on Excel Data")
+    uploaded_excel = st.file_uploader("Upload updated Excel file", type="xlsx")
+    if uploaded_excel and (uploaded_pptxs or (input_folder and os.path.isdir(input_folder))):
+        if st.button("Apply Edits to PPTX"):
+            pptx_files = uploaded_pptxs
+            if input_folder and os.path.isdir(input_folder):
+                pptx_files = [
+                    open(os.path.join(input_folder, f), "rb") for f in os.listdir(input_folder) if f.lower().endswith(".pptx")
+                ]
+            excel_bytes = uploaded_excel.getbuffer()
+            updated_files = update_table_and_balloon_for_all(excel_bytes, pptx_files)
+            if updated_files:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp_zip:
+                    with zipfile.ZipFile(tmp_zip.name, "w") as zf:
+                        for fname, file_bytes in updated_files.items():
+                            zf.writestr(fname, file_bytes)
+                    tmp_zip.seek(0)
+                    st.success(f"Updated {len(updated_files)} PPTX files! Download below.")
+                    st.download_button("Download All Edited PPTXs (ZIP)", data=open(tmp_zip.name, "rb").read(), file_name="edited_ppts.zip")
+            else:
+                st.warning("No PPTX files were updated.")
+    else:
+        st.info("Please upload Excel and PPTX files or specify valid local folder.")
 
-elif stage == "3: Edit PPTs from Excel":
-    st.header("Stage 3: Edit PPTs from Updated Excel")
-    excel_path = st.text_input("Excel File Path (with revision data)")
-    ppt_folder = st.text_input("PPTX Folder Path (to edit)")
-    output_folder = st.text_input("Output Folder Path (to save edited PPTX files)")
-    if st.button("Run Editing"):
-        if all([excel_path, ppt_folder, output_folder]) and os.path.exists(excel_path) and os.path.exists(ppt_folder):
-            update_table_and_balloon_for_all(excel_path, ppt_folder, output_folder)
-        else:
-            st.error("Please provide valid Excel, input and output folder paths.")
-
-elif stage == "4: Add Bullet Point to PPTX":
-    st.header("Stage 4: Add Bullet Point to PPTX")
-    input_folder = st.text_input("Input PPTX Folder Path")
-    output_folder = st.text_input("Output Folder Path")
-    new_text = st.text_area("New Bullet Text Line")
-    if st.button("Add Bullet Point"):
-        if input_folder and output_folder and new_text:
-            add_bullet_point_to_pptx(input_folder, output_folder, new_text)
-        else:
-            st.error("Please provide valid input/output folders and bullet text.")
+elif stage == "Step 3: Add Bullet Point to PPTX":
+    st.header("Step 3: Add Bullet Point")
+    new_text_line = st.text_area("Enter new bullet point text")
+    if uploaded_pptxs or (input_folder and os.path.isdir(input_folder)):
+        if st.button("Add Bullet Point"):
+            pptx_files = uploaded_pptxs
+            if input_folder and os.path.isdir(input_folder):
+                pptx_files = [
+                    open(os.path.join(input_folder, f), "rb") for f in os.listdir(input_folder) if f.lower().endswith(".pptx")
+                ]
+            updated_files = add_bullet_point_to_pptx(pptx_files, new_text_line)
+            if updated_files:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp_zip:
+                    with zipfile.ZipFile(tmp_zip.name, "w") as zf:
+                        for fname, file_bytes in updated_files.items():
+                            zf.writestr(fname, file_bytes)
+                    tmp_zip.seek(0)
+                    st.success(f"Added bullet to {len(updated_files)} PPTX files! Download below.")
+                    st.download_button("Download All PPTXs with Added Bullet (ZIP)", data=open(tmp_zip.name, "rb").read(), file_name="pptx_with_bullet.zip")
+            else:
+                st.warning("No bullet points added.")
+    else:
+        st.info("Please upload PPTX files or specify a valid folder.")
