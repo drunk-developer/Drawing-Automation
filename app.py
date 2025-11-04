@@ -8,6 +8,7 @@ from pptx.util import Pt
 from copy import deepcopy
 
 # --- Stage 1: Convert PPT to PPTX ---
+'''
 def convert_ppt_to_pptx(input_folder):
     ppt_files = [f for f in os.listdir(input_folder) if f.lower().endswith('.ppt')]
     powerpoint = win32com.client.Dispatch("PowerPoint.Application")
@@ -21,7 +22,7 @@ def convert_ppt_to_pptx(input_folder):
         presentation.Close()
     powerpoint.Quit()
     st.success("All .ppt files converted to .pptx.")
-
+'''
 # --- Stage 2: Extract revision data to Excel ---
 REV_HEADERS = [
     "RELEASE NUMBER", "REV LTR",
